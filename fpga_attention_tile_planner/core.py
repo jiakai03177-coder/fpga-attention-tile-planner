@@ -15,6 +15,50 @@ DTYPE_BYTES = {
     "fp8": 1,
 }
 
+DTYPE_DSPS_PER_MAC = {
+    "fp32": 5,
+    "float32": 5,
+    "bf16": 3,
+    "bfloat16": 3,
+    "fp16": 3,
+    "float16": 3,
+    "int8": 1,
+    "fp8": 1,
+}
+
+BRAM18K_BITS = 18 * 1024
+BRAM36K_BITS = 36 * 1024
+URAM_BITS = 288 * 1024
+
+
+@dataclass(frozen=True)
+class FPGADevice:
+    name: str
+    bram36k: int
+    uram: int
+    dsp: int
+
+    @property
+    def bram18k(self) -> int:
+        return self.bram36k * 2
+
+    @property
+    def total_bram_bytes(self) -> int:
+        return self.bram36k * BRAM36K_BITS // 8
+
+    @property
+    def total_uram_bytes(self) -> int:
+        return self.uram * URAM_BITS // 8
+
+
+FPGA_DEVICES = {
+    "vu9p": FPGADevice(name="VU9P (Alveo U200/U250)", bram36k=2160, uram=960, dsp=6840),
+    "vu13p": FPGADevice(name="VU13P (Alveo U55C)", bram36k=2688, uram=1280, dsp=12288),
+    "zcu102": FPGADevice(name="ZCU102 (ZU9EG)", bram36k=912, uram=0, dsp=2520),
+    "zcu104": FPGADevice(name="ZCU104 (ZU7EV)", bram36k=312, uram=96, dsp=1728),
+    "vck190": FPGADevice(name="VCK190 (VC1902)", bram36k=967, uram=463, dsp=1968),
+}
+
 
 PRESETS = {
     "llama2-7b": {
@@ -84,6 +128,22 @@ class AttentionShape:
 
 
 @dataclass(frozen=True)
+class ResourceEstimate:
+    bram18k: int
+    bram36k: int
+    uram: int
+    dsp: int
+    bram18k_pct: float | None = None
+    bram36k_pct: float | None = None
+    uram_pct: float | None = None
+    dsp_pct: float | None = None
+    device_name: str | None = None
+
+    def to_dict(self) -> dict[str, int | float | str | None]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class TileCandidate:
     query_tile: int
     key_tile: int
@@ -101,9 +161,62 @@ class TileCandidate:
     hbm_bytes_per_layer: int
     q_blocks_per_layer: int
     fits: bool
+    resources: ResourceEstimate | None = None
 
     def to_dict(self) -> dict[str, int | float | bool]:
-        return asdict(self)
+        d = asdict(self)
+        if self.resources is not None:
+            d["resources"] = self.resources.to_dict()
+        else:
+            d["resources"] = None
+        return d
+
+
+def estimate_resources(
+    total_sram_bytes: int,
+    tile_flops: int,
+    dtype: str,
+    device: FPGADevice | None = None,
+    head_dim: int = 128,
+    heads: int = 1,
+) -> ResourceEstimate:
+    total_bits = total_sram_bytes * 8
+
+    bram36k_count = ceil(total_bits / BRAM36K_BITS) if total_bits > 0 else 0
+    bram18k_count = bram36k_count * 2
+    uram_count = ceil(total_bits / URAM_BITS) if total_bits > 0 else 0
+
+    if device is not None and device.uram == 0:
+        uram_count = 0
+
+    dsps_per_mac = DTYPE_DSPS_PER_MAC.get(dtype.lower(), 3)
+    parallel_macs = heads * head_dim
+    dsp_count = parallel_macs * dsps_per_mac
+
+    bram18k_pct = None
+    bram36k_pct = None
+    uram_pct = None
+    dsp_pct = None
+    device_name = None
+
+    if device is not None:
+        device_name = device.name
+        bram18k_pct = (bram18k_count / device.bram18k * 100) if device.bram18k > 0 else 0.0
+        bram36k_pct = (bram36k_count / device.bram36k * 100) if device.bram36k > 0 else 0.0
+        uram_pct = (uram_count / device.uram * 100) if device.uram > 0 else 0.0
+        dsp_pct = (dsp_count / device.dsp * 100) if device.dsp > 0 else 0.0
+
+    return ResourceEstimate(
+        bram18k=bram18k_count,
+        bram36k=bram36k_count,
+        uram=uram_count,
+        dsp=dsp_count,
+        bram18k_pct=bram18k_pct,
+        bram36k_pct=bram36k_pct,
+        uram_pct=uram_pct,
+        dsp_pct=dsp_pct,
+        device_name=device_name,
+    )
 
 
 def tile_candidate(
@@ -112,6 +225,7 @@ def tile_candidate(
     key_tile: int,
     sram_bytes: int,
     double_buffer_kv: bool = False,
+    device: FPGADevice | None = None,
 ) -> TileCandidate:
     shape.validate()
     if query_tile < 1:
@@ -146,6 +260,10 @@ def tile_candidate(
     hbm_bytes_per_query_block = q_bytes + kv_full_sequence_bytes + output_bytes
     hbm_bytes_per_layer = q_blocks * hbm_bytes_per_query_block
 
+    resources = estimate_resources(
+        total_sram_bytes, tile_flops, shape.dtype, device, head_dim, shape.heads,
+    )
+
     return TileCandidate(
         query_tile=query_tile,
         key_tile=key_tile,
@@ -163,6 +281,7 @@ def tile_candidate(
         hbm_bytes_per_layer=hbm_bytes_per_layer,
         q_blocks_per_layer=q_blocks,
         fits=total_sram_bytes <= sram_bytes,
+        resources=resources,
     )
 
 
@@ -173,6 +292,7 @@ def plan_tiles(
     key_tiles: list[int],
     top: int = 5,
     double_buffer_kv: bool = False,
+    device: FPGADevice | None = None,
 ) -> list[TileCandidate]:
     if sram_kib < 1:
         raise ValueError("sram_kib must be >= 1")
@@ -181,7 +301,7 @@ def plan_tiles(
 
     sram_bytes = sram_kib * 1024
     candidates = [
-        tile_candidate(shape, query_tile, key_tile, sram_bytes, double_buffer_kv)
+        tile_candidate(shape, query_tile, key_tile, sram_bytes, double_buffer_kv, device)
         for query_tile in sorted(set(query_tiles))
         for key_tile in sorted(set(key_tiles))
     ]

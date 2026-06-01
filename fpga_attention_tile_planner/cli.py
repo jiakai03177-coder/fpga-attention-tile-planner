@@ -6,7 +6,7 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
-from .core import AttentionShape, PRESETS, format_bytes, format_number, plan_tiles
+from .core import AttentionShape, FPGA_DEVICES, PRESETS, format_bytes, format_number, plan_tiles
 
 
 DEFAULT_QUERY_TILES = "8,16,32,64,128"
@@ -30,6 +30,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--key-tiles", default=DEFAULT_KEY_TILES, help="Comma-separated key tile candidates.")
     parser.add_argument("--top", type=int, default=5, help="Number of fitting candidates to print. Defaults to 5.")
     parser.add_argument("--double-buffer-kv", action="store_true", help="Reserve extra SRAM for double-buffered K/V tiles.")
+    parser.add_argument("--device", choices=sorted(FPGA_DEVICES), help="FPGA device for resource estimates.")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     parser.add_argument("--csv", help="Write candidates to a CSV file.")
     return parser
@@ -117,37 +118,61 @@ def write_csv(path: str, candidates) -> Path:
     return output_path
 
 
-def print_candidates(shape: AttentionShape, candidates, sram_kib: int) -> None:
+def print_candidates(shape: AttentionShape, candidates, sram_kib: int, device_key: str | None = None) -> None:
     print("FPGA Attention Tile Planner")
     print("===========================")
     print(f"hidden_size={shape.hidden_size} heads={shape.heads} kv_heads={shape.normalized_kv_heads}")
-    print(f"seq_len={shape.seq_len} batch_size={shape.batch_size} dtype={shape.dtype} sram={sram_kib} KiB")
+    header_line = f"seq_len={shape.seq_len} batch_size={shape.batch_size} dtype={shape.dtype} sram={sram_kib} KiB"
+    if device_key:
+        device = FPGA_DEVICES[device_key]
+        header_line += f" device={device.name}"
+    print(header_line)
     print()
 
     if not candidates:
         print("No tile candidates fit the SRAM budget.")
         return
 
+    has_device = device_key is not None
+
     headers = [
         "q_tile",
         "k_tile",
         "SRAM",
         "util",
+        "BRAM18K",
+        "URAM",
+        "DSP",
         "FLOPs/tile",
-        "HBM/q-block",
         "HBM/layer",
         "AI",
     ]
     rows = []
     for candidate in candidates:
+        res = candidate.resources
+        if has_device and res:
+            bram_str = f"{res.bram18k} ({res.bram18k_pct:.1f}%)"
+            uram_str = f"{res.uram} ({res.uram_pct:.1f}%)" if res.uram > 0 else "0"
+            dsp_str = f"{format_number(res.dsp)} ({res.dsp_pct:.1f}%)"
+        elif res:
+            bram_str = str(res.bram18k)
+            uram_str = str(res.uram)
+            dsp_str = format_number(res.dsp)
+        else:
+            bram_str = "-"
+            uram_str = "-"
+            dsp_str = "-"
+
         rows.append(
             [
                 str(candidate.query_tile),
                 str(candidate.key_tile),
                 format_bytes(candidate.total_sram_bytes),
                 f"{candidate.sram_utilization:.1%}",
+                bram_str,
+                uram_str,
+                dsp_str,
                 format_number(candidate.tile_flops),
-                format_bytes(candidate.hbm_bytes_per_query_block),
                 format_bytes(candidate.hbm_bytes_per_layer),
                 f"{candidate.arithmetic_intensity_flops_per_byte:.2f}",
             ]
@@ -173,6 +198,8 @@ def main(argv: list[str] | None = None) -> int:
     query_tiles = parse_tile_list(args.query_tiles, "--query-tiles")
     key_tiles = parse_tile_list(args.key_tiles, "--key-tiles")
 
+    device = FPGA_DEVICES.get(args.device) if args.device else None
+
     try:
         candidates = plan_tiles(
             shape,
@@ -181,6 +208,7 @@ def main(argv: list[str] | None = None) -> int:
             key_tiles=key_tiles,
             top=args.top,
             double_buffer_kv=args.double_buffer_kv,
+            device=device,
         )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
@@ -194,6 +222,7 @@ def main(argv: list[str] | None = None) -> int:
                     "shape": asdict(shape),
                     "sram_kib": args.sram_kib,
                     "double_buffer_kv": args.double_buffer_kv,
+                    "device": args.device,
                     "candidates": [candidate.to_dict() for candidate in candidates],
                 },
                 indent=2,
@@ -201,7 +230,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0 if candidates else 1
 
-    print_candidates(shape, candidates, args.sram_kib)
+    print_candidates(shape, candidates, args.sram_kib, args.device)
     if csv_path:
         print()
         print(f"CSV written to {csv_path}")
